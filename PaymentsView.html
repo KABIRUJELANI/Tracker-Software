@@ -1,0 +1,68 @@
+<script>
+renderPage_payments = function (container) {
+  var canWrite = STATE.bootstrap.access.access.payments.write;
+  container.innerHTML =
+    '<div class="page-header"><div><h1>Payment & Financial Analysis</h1>' +
+    '<div class="section-note">Pending / received / completed tracking with overdue flagging and recurring follow-up.</div></div>' +
+    '<div class="actions">' + (canWrite ? '<button class="btn" id="btn-new-pay">+ New Payment</button>' : '') + '</div></div>' +
+    '<div id="pay-filters"></div><div id="pay-summary"></div><div id="pay-body"></div>';
+
+  var bodyEl = document.getElementById('pay-body');
+  var readFilters = renderFilterBar(document.getElementById('pay-filters'), { statuses: ['Pending', 'Received', 'Completed'] }, load);
+
+  function load(filters) {
+    filters = filters || readFilters();
+    skeletonBlock(bodyEl, 6);
+    apiCall('getPaymentsSummary', filters).then(function (s) {
+      document.getElementById('pay-summary').innerHTML = kpiTilesHtml([
+        { label: 'Pending (' + s.pendingCount + ')', value: fmtCurrency(s.pendingAmount) },
+        { label: 'Received (' + s.receivedCount + ')', value: fmtCurrency(s.receivedAmount) },
+        { label: 'Completed (' + s.completedCount + ')', value: fmtCurrency(s.completedAmount), tone: 'ok' },
+        { label: 'Overdue (' + s.overdueCount + ')', value: fmtCurrency(s.overdueAmount), tone: s.overdueCount ? 'danger' : 'ok' }
+      ]);
+    });
+    apiCall('listPayments', filters).then(function (rows) {
+      renderTable(bodyEl, [
+        { key: 'description', label: 'Description' }, { key: 'unit', label: 'Unit' }, { key: 'department', label: 'Department' },
+        { key: 'amount', label: 'Amount', render: function (r) { return fmtCurrency(r.amount); } },
+        { key: 'status', label: 'Status', render: function (r) { return badge(r.status) + (r.overdue ? ' ' + badge('Overdue') : ''); } },
+        { key: 'dueDate', label: 'Due', render: function (r) { return fmtDate(r.dueDate); } },
+        { key: 'followUpCount', label: 'Follow-ups', render: function (r) {
+            return escapeHtml(String(r.followUpCount || 0)) + (r.lastFollowUpAt ? ' <span class="section-note">last ' + fmtDate(r.lastFollowUpAt) + '</span>' : '');
+          } }
+      ].concat(canWrite ? [{ key: '_fu', label: '', render: function (r) {
+          return r.status === 'Completed' ? '' : '<button class="btn secondary btn-fu" data-id="' + escapeHtml(r.id) + '">Log follow-up</button>';
+        } }] : []), rows, canWrite ? { onEdit: function (row) { payForm(row); } } : {});
+      bodyEl.querySelectorAll('.btn-fu').forEach(function (btn) {
+        btn.addEventListener('click', function (e) {
+          e.stopPropagation();
+          var note = prompt('Follow-up note (who you contacted and what they said):', '');
+          if (note === null) return;
+          apiCall('logPaymentFollowUp', btn.dataset.id, note).then(function () { toast('Follow-up logged.', 'success'); load(); });
+        });
+      });
+    });
+  }
+
+  function payForm(row) {
+    openFormModal({
+      title: row ? 'Update Payment' : 'New Payment',
+      initial: row || {},
+      fields: [
+        { key: 'description', label: 'Description', type: 'text', full: true },
+        { key: 'unit', label: 'Unit', type: 'select', options: STATE.bootstrap.units.map(function (u) { return { v: u.unitId, l: u.name }; }) },
+        { key: 'department', label: 'Department', type: 'text' },
+        { key: 'contractId', label: 'Contract ID', type: 'text' },
+        { key: 'companyId', label: 'Company ID', type: 'text' },
+        { key: 'amount', label: 'Amount (NGN)', type: 'number' },
+        { key: 'status', label: 'Status', type: 'select', options: ['Pending', 'Received', 'Completed'] },
+        { key: 'dueDate', label: 'Due Date', type: 'date' }
+      ],
+      onSubmit: function (record) { return apiCall('savePayment', record).then(function () { toast('Saved.', 'success'); load(); }); }
+    });
+  }
+
+  if (canWrite) document.getElementById('btn-new-pay').addEventListener('click', function () { payForm(null); });
+  load({});
+};
+</script>

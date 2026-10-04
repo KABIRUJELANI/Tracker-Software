@@ -1,0 +1,356 @@
+<script>
+renderPage_register = function (container) {
+  var tab = 'staff';
+  var data = null;
+  var MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+  var flt = { office: '', team: '', status: 'working', mda: '', q: '', incomplete: false };
+
+  container.innerHTML =
+    '<div class="page-header"><div><h1>Staff & MDA Register</h1>' +
+    '<div class="section-note">Every staff member, their unit, team, Team Lead and assigned MDAs. MDA changes take effect from a stated date. Staff are never deleted: exited records are kept.</div></div>' +
+    '<div class="actions" id="rg-actions"></div></div>' +
+    '<div class="tabs" id="rg-tabs">' +
+      '<div class="tab active" data-tab="staff">Staff</div><div class="tab" data-tab="mdas">MDAs</div>' +
+      '<div class="tab" data-tab="vacancies">Vacancies</div><div class="tab" data-tab="handovers">Handover notes</div></div>' +
+    '<div id="rg-summary"></div><div id="rg-tools"></div><div id="rg-body"></div>';
+
+  var bodyEl = document.getElementById('rg-body');
+  container.querySelectorAll('#rg-tabs .tab').forEach(function (t) {
+    t.addEventListener('click', function () {
+      tab = t.dataset.tab;
+      container.querySelectorAll('#rg-tabs .tab').forEach(function (x) { x.classList.toggle('active', x === t); });
+      render();
+    });
+  });
+
+  /* ---------- helpers ---------- */
+  function day(k) { // 'yyyy-MM-dd' -> 'DD MMM YYYY' without any time-zone shift
+    if (!k) return '—';
+    var m = /^(\d{4})-(\d{2})-(\d{2})/.exec(String(k));
+    return m ? m[3] + ' ' + MONTHS[Number(m[2]) - 1] + ' ' + m[1] : fmtDate(k);
+  }
+  function todayKey() {
+    var d = new Date(); return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
+  }
+  function staffById(id) { return data.staff.filter(function (s) { return s.staffId === id; })[0]; }
+  function working() { return data.staff.filter(function (s) { return s.status === 'Active' || s.status === 'On leave'; }); }
+  function staffOptions(excludeId, emptyLabel) {
+    return [{ v: '', l: emptyLabel || 'None' }].concat(working().filter(function (s) { return s.staffId !== excludeId; })
+      .sort(function (a, b) { return a.fullName < b.fullName ? -1 : 1; })
+      .map(function (s) { return { v: s.staffId, l: s.fullName + ' (' + s.staffId + ')' }; }));
+  }
+  function selectHtml(id, options, value, disabled) {
+    return '<select id="' + id + '"' + (disabled ? ' disabled' : '') + '>' + options.map(function (o) {
+      var v = typeof o === 'string' ? o : o.v, l = typeof o === 'string' ? o : o.l;
+      return '<option value="' + escapeHtml(v) + '"' + (String(v) === String(value || '') ? ' selected' : '') + '>' + escapeHtml(l) + '</option>';
+    }).join('') + '</select>';
+  }
+  function mdaChips(s) {
+    var html = (s.currentMdas || []).map(function (m) { return '<span class="badge status-active">' + escapeHtml(m) + '</span>'; }).join(' ');
+    (s.scheduledMdas || []).forEach(function (m) { html += ' <span class="badge status-pending" title="Starts ' + day(m.from) + '">' + escapeHtml(m.mdaId) + ' from ' + day(m.from) + '</span>'; });
+    return html || '<span class="section-note">None</span>';
+  }
+
+  /* ---------- load + summary ---------- */
+  function load() {
+    skeletonBlock(bodyEl, 8);
+    apiCall('getRegister').then(function (d) {
+      data = d;
+      var actions = '<button class="btn secondary" id="btn-rg-csv">⬇ Export CSV</button>';
+      if (d.actor.canAdd) actions += '<button class="btn" id="btn-rg-add">+ Add Staff</button>';
+      if (d.actor.canManageMdas) actions += '<button class="btn secondary" id="btn-rg-mda">+ Add MDA</button>';
+      document.getElementById('rg-actions').innerHTML = actions;
+      document.getElementById('btn-rg-csv').addEventListener('click', exportCsv);
+      if (d.actor.canAdd) document.getElementById('btn-rg-add').addEventListener('click', function () { staffForm('add', null, null); });
+      if (d.actor.canManageMdas) document.getElementById('btn-rg-mda').addEventListener('click', function () { mdaForm(null); });
+
+      var count = function (st) { return d.staff.filter(function (s) { return s.status === st; }).length; };
+      document.getElementById('rg-summary').innerHTML = kpiTilesHtml([
+        { label: 'Active staff', value: count('Active') },
+        { label: 'On leave', value: count('On leave') },
+        { label: 'Vacancies', value: count('Vacant'), tone: count('Vacant') ? 'warn' : 'ok' },
+        { label: 'Incomplete records', value: d.staff.filter(function (s) { return s.missing.length; }).length, tone: d.staff.some(function (s) { return s.missing.length; }) ? 'warn' : 'ok' },
+        { label: 'MDAs with no officer', value: d.mdas.filter(function (m) { return m.noOfficer && m.status !== 'Inactive'; }).length, tone: d.mdas.some(function (m) { return m.noOfficer && m.status !== 'Inactive'; }) ? 'danger' : 'ok' },
+        { label: 'MDAs with no Team Lead', value: d.mdas.filter(function (m) { return m.noTeamLead && m.status !== 'Inactive'; }).length, tone: d.mdas.some(function (m) { return m.noTeamLead && m.status !== 'Inactive'; }) ? 'warn' : 'ok' },
+        { label: 'Open handovers', value: d.handovers.filter(function (h) { return h.status === 'Open'; }).length }
+      ]);
+      render();
+    }).catch(function () { bodyEl.innerHTML = '<div class="empty-state">Could not load the register. Reload the page and try again.</div>'; });
+  }
+
+  function render() {
+    if (!data) return;
+    var tools = document.getElementById('rg-tools');
+    tools.innerHTML = '';
+    if (tab === 'staff') renderStaff(tools);
+    else if (tab === 'mdas') renderMdas();
+    else if (tab === 'vacancies') renderVacancies();
+    else renderHandovers();
+  }
+
+  /* ---------- staff tab ---------- */
+  function renderStaff(tools) {
+    tools.innerHTML = '<div class="filter-bar">' +
+      '<div class="field"><label>Unit</label>' + selectHtml('rf-office', [{ v: '', l: 'All units' }].concat(data.options.offices), flt.office) + '</div>' +
+      '<div class="field"><label>Team</label>' + selectHtml('rf-team', [{ v: '', l: 'All teams' }].concat(data.options.teams), flt.team) + '</div>' +
+      '<div class="field"><label>Status</label>' + selectHtml('rf-status', [{ v: 'working', l: 'Active and on leave' }, { v: 'Active', l: 'Active' }, { v: 'On leave', l: 'On leave' }, { v: 'Exited', l: 'Exited' }, { v: '', l: 'All (except vacancies)' }], flt.status) + '</div>' +
+      '<div class="field"><label>MDA</label>' + selectHtml('rf-mda', [{ v: '', l: 'All MDAs' }, { v: '__none', l: 'No MDA assigned' }].concat(data.mdas.map(function (m) { return { v: m.id, l: m.id }; })), flt.mda) + '</div>' +
+      '<div class="field"><label>Search</label><input id="rf-q" type="text" placeholder="Name, ID, phone, email" value="' + escapeHtml(flt.q) + '"/></div>' +
+      '<div class="field"><label>&nbsp;</label><div class="checkbox-row"><input type="checkbox" id="rf-inc"' + (flt.incomplete ? ' checked' : '') + '/> <span>Incomplete only</span></div></div>' +
+      '</div>';
+    ['rf-office', 'rf-team', 'rf-status', 'rf-mda'].forEach(function (id) {
+      document.getElementById(id).addEventListener('change', function (e) { flt[{ 'rf-office': 'office', 'rf-team': 'team', 'rf-status': 'status', 'rf-mda': 'mda' }[id]] = e.target.value; drawStaffTable(); });
+    });
+    document.getElementById('rf-inc').addEventListener('change', function (e) { flt.incomplete = e.target.checked; drawStaffTable(); });
+    var timer = null;
+    document.getElementById('rf-q').addEventListener('input', function (e) { clearTimeout(timer); timer = setTimeout(function () { flt.q = e.target.value; drawStaffTable(); }, 250); });
+    drawStaffTable();
+  }
+
+  function filteredStaff() {
+    var q = flt.q.trim().toLowerCase();
+    return data.staff.filter(function (s) {
+      if (s.status === 'Vacant') return false;
+      if (flt.status === 'working' && !(s.status === 'Active' || s.status === 'On leave')) return false;
+      if (flt.status && flt.status !== 'working' && s.status !== flt.status) return false;
+      if (flt.office && s.office !== flt.office) return false;
+      if (flt.team && s.team !== flt.team) return false;
+      if (flt.mda === '__none' && s.currentMdas.length) return false;
+      if (flt.mda && flt.mda !== '__none' && s.currentMdas.indexOf(flt.mda) === -1) return false;
+      if (flt.incomplete && !s.missing.length) return false;
+      if (q && [s.fullName, s.staffId, s.phone, s.email, s.jobTitle].join(' ').toLowerCase().indexOf(q) === -1) return false;
+      return true;
+    });
+  }
+
+  function drawStaffTable() {
+    var rows = filteredStaff();
+    renderTable(bodyEl, [
+      { key: 'staffId', label: 'Staff ID' },
+      { key: 'fullName', label: 'Name', render: function (s) { return '<b>' + escapeHtml(s.fullName) + '</b><div class="section-note">' + escapeHtml(s.jobTitle || '') + '</div>'; } },
+      { key: 'systemRole', label: 'System role' },
+      { key: 'office', label: 'Unit' }, { key: 'team', label: 'Team' },
+      { key: 'teamLeadName', label: 'Team Lead', render: function (s) { return s.teamLeadName ? escapeHtml(s.teamLeadName) : '<span class="section-note">None</span>'; } },
+      { key: 'currentMdas', label: 'MDAs', render: mdaChips },
+      { key: 'status', label: 'Status', render: function (s) {
+          var cls = s.status === 'Exited' ? 'closed' : s.status === 'On leave' ? 'pending' : 'active';
+          return '<span class="badge status-' + cls + '">' + escapeHtml(s.status) + '</span>' + (s.exitDate ? '<div class="section-note">' + day(s.exitDate) + '</div>' : '');
+        } },
+      { key: 'phone', label: 'Phone' }, { key: 'email', label: 'Email' },
+      { key: 'missing', label: 'Record', render: function (s) { return s.missing.length ? '<span class="badge status-pending" title="Missing: ' + escapeHtml(s.missing.join(', ')) + '">Incomplete</span><div class="section-note">' + escapeHtml(s.missing.join(', ')) + '</div>' : '<span class="badge status-completed">Complete</span>'; } },
+      { key: '_a', label: '', render: function (s) {
+          var h = '';
+          if (s.canManage) h += '<button class="btn secondary rg-edit" data-id="' + escapeHtml(s.staffId) + '">Edit</button> ';
+          if (s.canManage && (s.status === 'Active' || s.status === 'On leave')) h += '<button class="btn danger rg-exit" data-id="' + escapeHtml(s.staffId) + '">Exit</button>';
+          return h;
+        } }
+    ], rows, { emptyMessage: 'No staff match these filters.' });
+    bodyEl.querySelectorAll('.rg-edit').forEach(function (b) { b.addEventListener('click', function () { staffForm('edit', staffById(b.dataset.id), null); }); });
+    bodyEl.querySelectorAll('.rg-exit').forEach(function (b) { b.addEventListener('click', function () { exitForm(staffById(b.dataset.id)); }); });
+  }
+
+  function exportCsv() {
+    var rows = (tab === 'staff' ? filteredStaff() : data.staff).map(function (s) {
+      return Object.assign({}, s, { mdaList: s.currentMdas.join('; '), missingList: s.missing.join('; '), startDate: day(s.startDate), exitDate: s.exitDate ? day(s.exitDate) : '' });
+    });
+    downloadCsv('Staff_Register.csv', [
+      { key: 'staffId', label: 'Staff ID' }, { key: 'fullName', label: 'Full Name' }, { key: 'jobTitle', label: 'Role' }, { key: 'systemRole', label: 'System Role' },
+      { key: 'office', label: 'Unit' }, { key: 'team', label: 'Team' }, { key: 'teamLeadName', label: 'Team Lead' }, { key: 'mdaList', label: 'Assigned MDAs' },
+      { key: 'status', label: 'Status' }, { key: 'phone', label: 'Phone' }, { key: 'email', label: 'Email' }, { key: 'startDate', label: 'Start Date' },
+      { key: 'exitDate', label: 'Exit Date' }, { key: 'missingList', label: 'Missing Fields' }
+    ], rows);
+  }
+
+  /* ---------- add / edit form (custom: needs an MDA multi-select) ---------- */
+  function staffForm(mode, row, vacancy) {
+    var init = row ? Object.assign({}, row, { mdaIds: row.currentMdas.concat((row.scheduledMdas || []).map(function (m) { return m.mdaId; })) })
+      : vacancy ? { jobTitle: vacancy.jobTitle, office: vacancy.office, team: vacancy.team, teamLeadStaffId: vacancy.teamLeadStaffId, systemRole: 'Staff/Officer', mdaIds: [] }
+      : { office: data.actor.phOnly ? 'Port Harcourt' : 'Head Office', systemRole: 'Staff/Officer', mdaIds: [] };
+    var offices = data.actor.phOnly ? ['Port Harcourt'] : data.options.offices;
+    var roles = data.options.systemRoles;
+    var activeMdas = data.mdas.filter(function (m) { return m.status !== 'Inactive' || init.mdaIds.indexOf(m.id) !== -1; });
+    var titles = {}; data.staff.forEach(function (s) { if (s.jobTitle) titles[s.jobTitle] = true; });
+
+    var bd = document.createElement('div'); bd.className = 'modal-backdrop';
+    bd.innerHTML = '<div class="modal" style="width:760px;max-width:96vw;">' +
+      '<h2>' + (mode === 'edit' ? 'Update ' + escapeHtml(row.fullName) + ' (' + escapeHtml(row.staffId) + ')' : vacancy ? 'Fill vacancy ' + escapeHtml(vacancy.staffId) : 'Add Staff') + '</h2>' +
+      '<div id="sf-errors"></div>' +
+      '<div class="form-grid">' +
+        '<div class="form-field full"><label>Full name</label><input id="sf-fullName" type="text" value="' + escapeHtml(init.fullName || '') + '"/></div>' +
+        '<div class="form-field"><label>Role (job title)</label><input id="sf-jobTitle" type="text" list="sf-titles" value="' + escapeHtml(init.jobTitle || '') + '"/>' +
+          '<datalist id="sf-titles">' + Object.keys(titles).map(function (t) { return '<option value="' + escapeHtml(t) + '">'; }).join('') + '</datalist></div>' +
+        '<div class="form-field"><label>System role (what they can access)</label>' + selectHtml('sf-systemRole', roles, init.systemRole || 'Staff/Officer', !data.actor.canAssignRoles) + '</div>' +
+        '<div class="form-field"><label>Unit</label>' + selectHtml('sf-office', offices, init.office) + '</div>' +
+        '<div class="form-field"><label>Team</label>' + selectHtml('sf-team', [{ v: '', l: 'Choose…' }].concat(data.options.teams), init.team) + '</div>' +
+        '<div class="form-field"><label>Team Lead</label>' + selectHtml('sf-teamLeadStaffId', staffOptions(row ? row.staffId : '', 'Choose…'), init.teamLeadStaffId) + '</div>' +
+        '<div class="form-field"><label>Phone</label><input id="sf-phone" type="tel" value="' + escapeHtml(init.phone || '') + '"/></div>' +
+        '<div class="form-field"><label>Email (also their login)</label><input id="sf-email" type="email" value="' + escapeHtml(init.email || '') + '"/></div>' +
+        '<div class="form-field"><label>Start date</label><input id="sf-startDate" type="date" value="' + escapeHtml(init.startDate || '') + '"/></div>' +
+        (mode === 'edit' && row.status !== 'Exited' ? '<div class="form-field"><label>Status</label>' + selectHtml('sf-status', data.options.editStatuses, row.status) + '</div>' : '') +
+        '<div class="form-field full"><label>Assigned MDAs</label><div id="sf-mdas" style="display:flex;flex-wrap:wrap;gap:6px 16px;padding:8px 10px;border:1px solid #DCE3EC;border-radius:8px;background:#FBFCFE;">' +
+          activeMdas.map(function (m) {
+            return '<label style="display:flex;align-items:center;gap:6px;font-size:13px;text-transform:none;font-weight:400;letter-spacing:0;color:inherit;margin:0;">' +
+              '<input type="checkbox" value="' + escapeHtml(m.id) + '"' + (init.mdaIds.indexOf(m.id) !== -1 ? ' checked' : '') + '/>' + escapeHtml(m.id) + '</label>';
+          }).join('') + '</div></div>' +
+        (mode === 'edit' ? '<div class="form-field" id="sf-eff-wrap" style="display:none;"><label>MDA change takes effect from</label><input id="sf-eff" type="date" value="' + todayKey() + '"/></div>' : '') +
+        '<div class="form-field full"><label>Notes</label><textarea id="sf-notes">' + escapeHtml(init.notes || '') + '</textarea></div>' +
+      '</div>' +
+      '<div class="modal-actions"><button class="btn secondary" id="sf-cancel">Cancel</button><button class="btn" id="sf-next">Review</button></div></div>';
+    document.body.appendChild(bd);
+
+    var close = function () { if (document.body.contains(bd)) document.body.removeChild(bd); };
+    bd.querySelector('#sf-cancel').addEventListener('click', close);
+    var original = init.mdaIds.slice().sort().join();
+    var chosenMdas = function () { return Array.prototype.map.call(bd.querySelectorAll('#sf-mdas input:checked'), function (c) { return c.value; }); };
+    if (mode === 'edit') bd.querySelectorAll('#sf-mdas input').forEach(function (c) {
+      c.addEventListener('change', function () { bd.querySelector('#sf-eff-wrap').style.display = chosenMdas().sort().join() !== original ? '' : 'none'; });
+    });
+
+    var collect = function () {
+      var r = { mdaIds: chosenMdas() };
+      ['fullName', 'jobTitle', 'systemRole', 'office', 'team', 'teamLeadStaffId', 'phone', 'email', 'startDate', 'notes'].forEach(function (k) { r[k] = bd.querySelector('#sf-' + k).value; });
+      if (mode === 'edit') { r.staffId = row.staffId; r.status = bd.querySelector('#sf-status') ? bd.querySelector('#sf-status').value : row.status; }
+      return r;
+    };
+    bd.querySelector('#sf-next').addEventListener('click', function () {
+      var rec = collect();
+      var opts = { effectiveDate: mode === 'edit' ? bd.querySelector('#sf-eff').value : '', fillVacancyId: vacancy ? vacancy.staffId : '' };
+      var btn = bd.querySelector('#sf-next'); btn.disabled = true; btn.textContent = 'Checking…';
+      apiCall('previewStaffChange', mode, rec, opts).then(function (plan) {
+        btn.disabled = false; btn.textContent = 'Review';
+        var blocking = plan.errors.filter(function (e) { return !/^Choose a cover officer/.test(e); });
+        if (blocking.length) { bd.querySelector('#sf-errors').innerHTML = errorBox(blocking); bd.querySelector('.modal').scrollTop = 0; return; }
+        bd.querySelector('#sf-errors').innerHTML = '';
+        confirmChange(plan, rec, opts, row, function (finalOpts) { return apiCall('saveStaff', mode, rec, finalOpts); }, close);
+      }).catch(function () { btn.disabled = false; btn.textContent = 'Review'; });
+    });
+  }
+
+  function errorBox(list) {
+    return '<div class="card" style="border-color:#C0392B;background:#FDF2F1;margin-bottom:12px;"><b style="color:#C0392B;">Please fix:</b><ul style="margin:6px 0 0 18px;">' +
+      list.map(function (e) { return '<li>' + escapeHtml(e) + '</li>'; }).join('') + '</ul></div>';
+  }
+
+  /* ---------- confirmation step (module 5b): summary, duplicates, warnings, cover officers ---------- */
+  function confirmChange(plan, rec, opts, row, saveFn, closeForm) {
+    var leaving = row ? row.staffId : '';
+    var bd = document.createElement('div'); bd.className = 'modal-backdrop';
+    var html = '<div class="modal" style="width:640px;max-width:96vw;"><h2>Check and confirm</h2>' +
+      '<div class="table-wrap"><table class="data-table"><tbody>' +
+      plan.summary.map(function (r) { return '<tr><th style="width:38%;cursor:default;">' + escapeHtml(r[0]) + '</th><td>' + escapeHtml(r[1] || '—') + '</td></tr>'; }).join('') +
+      '</tbody></table></div>';
+    if (plan.duplicates.length) {
+      html += '<div class="card" style="border-color:#B7791F;background:#FFF8EB;margin-top:12px;"><b>Possible duplicate</b><ul style="margin:6px 0 8px 18px;">' +
+        plan.duplicates.map(function (d) { return '<li>' + escapeHtml(d.fullName + ' (' + d.staffId + ', ' + d.status + '): ' + d.why) + '</li>'; }).join('') +
+        '</ul><div class="checkbox-row"><input type="checkbox" id="cf-dup"/> <span>I have checked: this is a different person.</span></div></div>';
+    }
+    if (plan.orphanedMdas.length) {
+      html += '<div class="card" style="border-color:#C0392B;margin-top:12px;"><b>Cover officer needed</b>' +
+        '<div class="section-note" style="margin:4px 0 8px;">These MDAs would have no assigned officer. Choose who covers each one from ' + day(plan.effectiveDate) + '.</div>' +
+        plan.orphanedMdas.map(function (o) {
+          return '<div class="form-field" style="margin-bottom:8px;"><label>' + escapeHtml(o.id) + '</label>' + selectHtml('cf-cover-' + o.id.replace(/[^A-Za-z0-9]/g, '_'), staffOptions(leaving, 'Choose cover officer…'), '') + '</div>';
+        }).join('') + '</div>';
+    }
+    if (plan.warnings.length) {
+      html += '<div class="card" style="margin-top:12px;"><b>Please note</b><ul style="margin:6px 0 0 18px;">' + plan.warnings.map(function (w) { return '<li>' + escapeHtml(w) + '</li>'; }).join('') + '</ul></div>';
+    }
+    html += '<div class="modal-actions"><button class="btn secondary" id="cf-back">Back</button><button class="btn" id="cf-save">Confirm and save</button></div></div>';
+    bd.innerHTML = html;
+    document.body.appendChild(bd);
+    var close = function () { if (document.body.contains(bd)) document.body.removeChild(bd); };
+    bd.querySelector('#cf-back').addEventListener('click', close);
+    bd.querySelector('#cf-save').addEventListener('click', function () {
+      if (plan.duplicates.length && !bd.querySelector('#cf-dup').checked) { toast('Tick the box to confirm this is not a duplicate.', 'error'); return; }
+      var covers = {}; var missingCover = [];
+      plan.orphanedMdas.forEach(function (o) {
+        var v = bd.querySelector('#cf-cover-' + o.id.replace(/[^A-Za-z0-9]/g, '_')).value;
+        if (v) covers[o.id] = v; else missingCover.push(o.id);
+      });
+      if (missingCover.length) { toast('Choose a cover officer for ' + missingCover.join(', ') + '.', 'error'); return; }
+      var btn = bd.querySelector('#cf-save'); btn.disabled = true; btn.textContent = 'Saving…';
+      saveFn(Object.assign({}, opts, { covers: covers, confirmed: true })).then(function () {
+        close(); closeForm(); toast('Saved.', 'success'); load();
+      }).catch(function () { btn.disabled = false; btn.textContent = 'Confirm and save'; });
+    });
+  }
+
+  /* ---------- exit ---------- */
+  function exitForm(s) {
+    var bd = document.createElement('div'); bd.className = 'modal-backdrop';
+    bd.innerHTML = '<div class="modal"><h2>Exit ' + escapeHtml(s.fullName) + '</h2>' +
+      '<div class="section-note" style="margin-bottom:10px;">The record is kept with status Exited and all past reports stay. Their login is disabled and a handover note is opened for each MDA.</div>' +
+      '<div id="xf-errors"></div><div class="form-grid">' +
+      '<div class="form-field"><label>Exit date (last day)</label><input id="xf-date" type="date" value="' + todayKey() + '"/></div>' +
+      '<div class="form-field full"><label>Reason</label><textarea id="xf-reason" placeholder="For example: resigned, contract ended, transferred"></textarea></div>' +
+      '</div><div class="modal-actions"><button class="btn secondary" id="xf-cancel">Cancel</button><button class="btn danger" id="xf-next">Review</button></div></div>';
+    document.body.appendChild(bd);
+    var close = function () { if (document.body.contains(bd)) document.body.removeChild(bd); };
+    bd.querySelector('#xf-cancel').addEventListener('click', close);
+    bd.querySelector('#xf-next').addEventListener('click', function () {
+      var opts = { exitDate: bd.querySelector('#xf-date').value, exitReason: bd.querySelector('#xf-reason').value };
+      apiCall('previewStaffChange', 'exit', { staffId: s.staffId }, opts).then(function (plan) {
+        var blocking = plan.errors.filter(function (e) { return !/^Choose a cover officer/.test(e); });
+        if (blocking.length) { bd.querySelector('#xf-errors').innerHTML = errorBox(blocking); return; }
+        confirmChange(plan, { staffId: s.staffId }, opts, s, function (finalOpts) { return apiCall('exitStaff', s.staffId, finalOpts); }, close);
+      });
+    });
+  }
+
+  /* ---------- MDAs tab ---------- */
+  function renderMdas() {
+    renderTable(bodyEl, [
+      { key: 'id', label: 'Code' }, { key: 'name', label: 'Name' },
+      { key: 'teamLeadName', label: 'Team Lead', render: function (m) { return m.teamLeadName ? escapeHtml(m.teamLeadName) : '<span class="badge status-pending">None</span><div class="section-note">Reviews and alerts go to the Assistant Head</div>'; } },
+      { key: 'officers', label: 'Assigned officers', render: function (m) {
+          return m.officers.length ? m.officers.map(function (o) { return escapeHtml(o.name) + (o.office === 'Port Harcourt' ? ' <span class="section-note">(PH)</span>' : ''); }).join('<br>') : '<span class="badge status-overdue">No officer</span>';
+        } },
+      { key: 'status', label: 'Status', render: function (m) { return badge(m.status || 'Active'); } },
+      { key: 'notes', label: 'Notes' }
+    ], data.mdas, data.actor.canManageMdas ? { onEdit: function (m) { mdaForm(m); } } : {});
+  }
+
+  function mdaForm(m) {
+    openFormModal({
+      title: m ? 'Update MDA ' + m.id : 'Add MDA', initial: m ? Object.assign({}, m) : { status: 'Active' },
+      fields: [
+        { key: 'id', label: m ? 'Code (cannot be changed)' : 'Code (short, for example FERMA)', type: 'text' },
+        { key: 'name', label: 'Full name', type: 'text' },
+        { key: 'teamLeadStaffId', label: 'Team Lead', type: 'select', options: staffOptions('', 'None (Assistant Head receives alerts)') },
+        { key: 'status', label: 'Status', type: 'select', options: ['Active', 'Inactive'] },
+        { key: 'notes', label: 'Notes', type: 'textarea', full: true }
+      ],
+      onSubmit: function (record) {
+        if (m) record.id = m.id; // the code is the key used by assignments and reports
+        record.isNew = !m;
+        return apiCall('saveMda', record).then(function () { toast('MDA saved.', 'success'); load(); });
+      }
+    });
+  }
+
+  /* ---------- vacancies tab ---------- */
+  function renderVacancies() {
+    var rows = data.staff.filter(function (s) { return s.status === 'Vacant'; });
+    renderTable(bodyEl, [
+      { key: 'staffId', label: 'Position ID' }, { key: 'fullName', label: 'Position' }, { key: 'jobTitle', label: 'Role' },
+      { key: 'office', label: 'Unit' }, { key: 'team', label: 'Team' }, { key: 'teamLeadName', label: 'Team Lead' },
+      { key: '_a', label: '', render: function (s) { return s.canManage ? '<button class="btn rg-fill" data-id="' + escapeHtml(s.staffId) + '">Fill vacancy</button>' : ''; } }
+    ], rows, { emptyMessage: 'No vacant positions.' });
+    bodyEl.querySelectorAll('.rg-fill').forEach(function (b) { b.addEventListener('click', function () { staffForm('add', null, staffById(b.dataset.id)); }); });
+  }
+
+  /* ---------- handover notes tab ---------- */
+  function renderHandovers() {
+    bodyEl.innerHTML = '<div class="section-note" style="margin-bottom:10px;">Opened automatically when a staff member exits or loses an MDA. The full handover form, with the 3 sign-offs, comes in a later update. Nothing is lost in the meantime.</div><div id="rg-ho"></div>';
+    var rows = data.handovers.slice().sort(function (a, b) { return String(b.createdAt) < String(a.createdAt) ? -1 : 1; });
+    renderTable(document.getElementById('rg-ho'), [
+      { key: 'createdAt', label: 'Opened', render: function (h) { return day(String(h.createdAt).slice(0, 10)); } },
+      { key: 'outgoingName', label: 'Outgoing officer' }, { key: 'mdaId', label: 'MDA' },
+      { key: 'incomingName', label: 'Incoming officer', render: function (h) { return h.incomingName ? escapeHtml(h.incomingName) : '<span class="section-note">Not set</span>'; } },
+      { key: 'trigger', label: 'Reason' }, { key: 'dueDate', label: 'Effective', render: function (h) { return day(h.dueDate); } },
+      { key: 'status', label: 'Status', render: function (h) { return badge(h.status); } }
+    ], rows, { emptyMessage: 'No handover notes yet.' });
+  }
+
+  load();
+};
+</script>

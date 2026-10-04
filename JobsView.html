@@ -1,0 +1,121 @@
+<script>
+renderPage_jobs = function (container) {
+  var canWrite = STATE.bootstrap.access.access.jobs.write;
+  var selectedYear = '';
+  container.innerHTML =
+    '<div class="page-header"><div><h1>Jobs / Analysis</h1>' +
+    '<div class="section-note">Untouched (not started) and In Progress (uncompleted) are tracked as distinct categories, with ageing.</div></div>' +
+    '<div class="actions">' + (canWrite ? '<button class="btn" id="btn-new-job">+ New Job</button>' : '') + '</div></div>' +
+    '<div class="tabs"><div class="tab active" data-tab="all">All Jobs</div><div class="tab" data-tab="pending">Pending Jobs Analysis (Ageing)</div></div>' +
+    '<div id="job-year-filter" style="margin-bottom:12px;"></div>' +
+    '<div id="job-filters"></div><div id="job-body"></div>';
+
+  var mode = 'all';
+  container.querySelectorAll('.tab').forEach(function (t) {
+    t.addEventListener('click', function () {
+      mode = t.dataset.tab;
+      container.querySelectorAll('.tab').forEach(function (x) { x.classList.toggle('active', x === t); });
+      render();
+    });
+  });
+
+  var thisYear = new Date().getFullYear();
+  var yearOptions = [''];
+  for (var y = thisYear + 1; y >= 2024; y--) yearOptions.push(String(y));
+  document.getElementById('job-year-filter').innerHTML =
+    '<div class="filter-bar"><div class="field"><label>Year</label><select id="job-year-select">' +
+    yearOptions.map(function (y) { return '<option value="' + y + '">' + (y || 'All Jobs') + '</option>'; }).join('') +
+    '</select></div></div>';
+  document.getElementById('job-year-select').addEventListener('change', function (e) { selectedYear = e.target.value; render(); });
+
+  function yearOf_(job) {
+    var d = job.dueDate || job.createdAt;
+    return d ? new Date(d).getFullYear().toString() : '';
+  }
+
+  var bodyEl = document.getElementById('job-body');
+  var readFilters = renderFilterBar(document.getElementById('job-filters'), { hideDepartment: true, hidePerson: true, statuses: ['Untouched', 'In Progress', 'Completed', 'Overdue'] }, render);
+
+  function render(filters) {
+    filters = filters || readFilters();
+    skeletonBlock(bodyEl, 6);
+    if (mode === 'all') renderAll(filters); else renderAgeing(filters);
+  }
+
+  function renderAll(filters) {
+    apiCall('listJobs', filters).then(function (rows) {
+      if (selectedYear) rows = rows.filter(function (r) { return yearOf_(r) === selectedYear; });
+      var summary = kpiTilesHtml([
+        { label: 'Untouched', value: rows.filter(function (r) { return r.status === 'Untouched'; }).length, tone: 'warn' },
+        { label: 'In Progress (uncompleted)', value: rows.filter(function (r) { return r.status === 'In Progress'; }).length },
+        { label: 'Completed', value: rows.filter(function (r) { return r.status === 'Completed'; }).length, tone: 'ok' },
+        { label: 'Overdue', value: rows.filter(function (r) { return r.status === 'Overdue' || r.overdue; }).length, tone: rows.some(function (r) { return r.overdue; }) ? 'danger' : 'ok' }
+      ]);
+      bodyEl.innerHTML = summary + '<div id="job-table"></div>';
+      renderTable(document.getElementById('job-table'), [
+        { key: 'title', label: 'Job' }, { key: 'unit', label: 'Unit' },
+        { key: 'assignedTo', label: 'Assigned To' }, { key: 'priority', label: 'Priority' },
+        { key: 'status', label: 'Status', render: function (r) { return badge(r.status) + (r.overdue && r.status !== 'Overdue' ? ' ' + badge('Overdue') : ''); } },
+        { key: 'ageDays', label: 'Age (days)' }, { key: 'dueDate', label: 'Due', render: function (r) { return fmtDate(r.dueDate); } },
+        { key: '_actions', label: '', render: function (r) {
+            return canWrite ? '<button class="btn danger btn-del-job" data-id="' + r.id + '">Delete</button>' : '';
+          } }
+      ], rows, canWrite ? { onEdit: function (row) { jobForm(row); } } : {});
+      if (canWrite) {
+        document.getElementById('job-table').querySelectorAll('.btn-del-job').forEach(function (btn) {
+          btn.addEventListener('click', function () {
+            if (!confirm('Delete this job? This cannot be undone.')) return;
+            apiCall('deleteJob', btn.dataset.id).then(function () { toast('Job deleted.', 'success'); render(); });
+          });
+        });
+      }
+    }).catch(function () {
+      bodyEl.innerHTML = '<div class="empty-state">Could not load jobs. Try clearing filters, or reload the page.</div>';
+    });
+  }
+
+  function renderAgeing(filters) {
+    apiCall('getPendingJobsAnalysis', filters).then(function (a) {
+      var b = a.ageingBuckets;
+      bodyEl.innerHTML = kpiTilesHtml([
+        { label: 'Untouched', value: a.untouched.length, tone: 'warn' },
+        { label: 'In Progress', value: a.inProgress.length },
+        { label: 'Manually flagged Overdue', value: (a.manuallyOverdue || []).length, tone: 'danger' },
+        { label: '0–3 days', value: b['0-3 days'].length },
+        { label: '4–7 days', value: b['4-7 days'].length },
+        { label: '8–14 days', value: b['8-14 days'].length, tone: 'warn' },
+        { label: '15+ days', value: b['15+ days'].length, tone: 'danger' }
+      ]) + '<div id="ageing-table"></div>';
+      var all = a.untouched.concat(a.inProgress, a.manuallyOverdue || []);
+      if (selectedYear) all = all.filter(function (r) { return yearOf_(r) === selectedYear; });
+      renderTable(document.getElementById('ageing-table'), [
+        { key: 'title', label: 'Job' }, { key: 'unit', label: 'Unit' },
+        { key: 'status', label: 'Status', render: function (r) { return badge(r.status); } },
+        { key: 'ageDays', label: 'Age (days)' }, { key: 'assignedTo', label: 'Assigned To' }
+      ], all, { emptyMessage: 'No untouched, in-progress, or overdue jobs match these filters — everything is either completed or nothing has been logged yet. Use "+ New Job" to add one.' });
+    }).catch(function () {
+      bodyEl.innerHTML = '<div class="empty-state">Could not load the ageing analysis. Try clearing filters, or reload the page.</div>';
+    });
+  }
+
+  function jobForm(row) {
+    openFormModal({
+      title: row ? 'Update Job' : 'New Job',
+      initial: row || {},
+      fields: [
+        { key: 'title', label: 'Title', type: 'text', full: true },
+        { key: 'description', label: 'Description', type: 'textarea', full: true },
+        { key: 'unit', label: 'Unit', type: 'select', options: STATE.bootstrap.units.map(function (u) { return { v: u.unitId, l: u.name }; }) },
+        { key: 'assignedTo', label: 'Assigned To (email)', type: 'text' },
+        { key: 'priority', label: 'Priority', type: 'select', options: ['Normal', 'High'] },
+        { key: 'status', label: 'Status', type: 'select', options: ['Untouched', 'In Progress', 'Completed', 'Overdue'] },
+        { key: 'dueDate', label: 'Due Date', type: 'date' }
+      ],
+      onSubmit: function (record) { return apiCall('saveJob', record).then(function () { toast('Saved.', 'success'); render(); }); }
+    });
+  }
+
+  if (canWrite) document.getElementById('btn-new-job').addEventListener('click', function () { jobForm(null); });
+  render({});
+};
+</script>

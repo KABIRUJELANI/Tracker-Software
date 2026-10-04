@@ -1,0 +1,236 @@
+<script>
+renderPage_admin = function (container) {
+  container.innerHTML =
+    '<div class="page-header"><div><h1>Profile & Administrative Setup</h1>' +
+    '<div class="section-note">User profiles, roles, access levels, units, escalation thresholds and KPI targets.</div></div></div>' +
+    '<div class="tabs"><div class="tab active" data-tab="users">Users & Roles</div><div class="tab" data-tab="access">Access Control</div>' +
+    '<div class="tab" data-tab="units">Units</div><div class="tab" data-tab="settings">Thresholds & Settings</div>' +
+    '<div class="tab" data-tab="states">States</div><div class="tab" data-tab="holidays">Public Holidays</div>' +
+    '<div class="tab" data-tab="audit">Audit Log</div></div>' +
+    '<div id="admin-body"></div>';
+
+  var mode = 'users';
+  container.querySelectorAll('.tab').forEach(function (t) { t.addEventListener('click', function () { mode = t.dataset.tab; container.querySelectorAll('.tab').forEach(function (x) { x.classList.toggle('active', x === t); }); render(); }); });
+
+  var bodyEl = document.getElementById('admin-body');
+
+  function render() {
+    skeletonBlock(bodyEl, 6);
+    if (mode === 'users') renderUsers();
+    else if (mode === 'access') renderAccess();
+    else if (mode === 'units') renderUnits();
+    else if (mode === 'settings') renderSettings();
+    else if (mode === 'states') renderStates();
+    else if (mode === 'holidays') renderHolidays();
+    else renderAudit();
+  }
+
+  function renderUsers() {
+    apiCall('listUsers').then(function (rows) {
+      bodyEl.innerHTML = '<div class="page-header"><h2>Users</h2><button class="btn" id="btn-new-user">+ Add Staff</button></div>' +
+        '<div class="section-note" style="margin-bottom:10px;">Add or remove staff here, set their role (which drives what they can see under Access Control), and issue or reset their login password.</div>' +
+        '<div id="users-table"></div>' + dangerZone_();
+      renderTable(document.getElementById('users-table'), [
+        { key: 'email', label: 'Email' }, { key: 'name', label: 'Name' }, { key: 'role', label: 'Role', render: function (r) { return badge(r.role); } },
+        { key: 'unit', label: 'Unit' },
+        { key: 'active', label: 'Active', render: function (r) { return r.active === false ? badge('Overdue') : badge('Completed'); } },
+        { key: 'hasPassword', label: 'Login', render: function (r) { return r.hasPassword ? badge('Completed') : badge('Pending') + ' <span class="section-note">no password set</span>'; } },
+        { key: '_actions', label: '', render: function (r) {
+            return '<button class="btn secondary btn-pw" data-email="' + escapeHtml(r.email) + '" style="margin-right:6px;">Set Password</button>' +
+              '<button class="btn danger btn-del" data-email="' + escapeHtml(r.email) + '">Remove</button>';
+          } }
+      ], rows, { onEdit: userForm });
+      document.getElementById('btn-new-user').addEventListener('click', function () { userForm(null); });
+      bindPwAndDelete_(document.getElementById('users-table'), rows);
+      document.getElementById('btn-wipe-staff').addEventListener('click', function () {
+        if (!confirm('Remove ALL staff except your own account? This deletes every other login and cannot be undone.')) return;
+        if (!confirm('Really sure? Type-to-confirm isn\'t available here — this is your last chance to cancel.')) return;
+        apiCall('deleteAllStaff').then(function (res) { toast(res.removed + ' staff record(s) removed.', 'success'); render(); });
+      });
+    });
+  }
+
+  function bindPwAndDelete_(scope, rows) {
+    scope.querySelectorAll('.btn-pw').forEach(function (btn) {
+      btn.addEventListener('click', function (e) { e.stopPropagation(); setPasswordForm(btn.dataset.email); });
+    });
+    scope.querySelectorAll('.btn-del').forEach(function (btn) {
+      btn.addEventListener('click', function (e) {
+        e.stopPropagation();
+        if (!confirm('Remove ' + btn.dataset.email + '? They will lose access immediately. This cannot be undone.')) return;
+        apiCall('deleteUser', btn.dataset.email).then(function () { toast('Staff removed.', 'success'); render(); });
+      });
+    });
+  }
+
+  function setPasswordForm(email) {
+    openFormModal({
+      title: 'Set Password — ' + email,
+      fields: [{ key: 'password', label: 'New Password (min 6 characters)', type: 'password' }],
+      onSubmit: function (record) {
+        return apiCall('setUserPassword', email, record.password).then(function () { toast('Password updated for ' + email + '.', 'success'); });
+      }
+    });
+  }
+
+  function userForm(row) {
+    var roles = Object.keys(STATE.bootstrap.access.roles).map(function (k) { return STATE.bootstrap.access.roles[k]; });
+    openFormModal({
+      title: row ? 'Update Staff' : 'Add Staff', initial: row || {},
+      fields: [
+        { key: 'email', label: 'Email (username)', type: 'text', full: true },
+        { key: 'name', label: 'Name', type: 'text' },
+        { key: 'role', label: 'Role', type: 'select', options: roles },
+        { key: 'unit', label: 'Unit', type: 'select', options: [{ v: '', l: '—' }].concat(STATE.bootstrap.units.map(function (u) { return { v: u.unitId, l: u.name }; })) },
+        { key: 'department', label: 'Department', type: 'text' },
+        { key: 'active', label: 'Active', type: 'checkbox', checkboxLabel: 'Account active — unchecking blocks sign-in immediately', default: true },
+        { key: 'password', label: row ? 'New Password (leave blank to keep current)' : 'Password (leave blank to set later)', type: 'password', full: true }
+      ],
+      onSubmit: function (record) {
+        var password = record.password;
+        delete record.password; // never sent to saveUser — passwords go through setUserPassword's own hashing path
+        return apiCall('saveUser', record).then(function () {
+          if (password) return apiCall('setUserPassword', record.email, password);
+        }).then(function () {
+          toast(password ? 'Saved — login is ready.' : 'Saved. Set a password so this person can sign in.', 'success');
+          render();
+        });
+      }
+    });
+  }
+
+  function dangerZone_() {
+    return '<div class="card" style="border-color:#C0392B;">' +
+      '<h3 style="color:#C0392B;">Danger Zone</h3>' +
+      '<div class="section-note" style="margin-bottom:10px;">Permanently removes every staff record except your own account (so you can\'t lock yourself out). This cannot be undone.</div>' +
+      '<button class="btn danger" id="btn-wipe-staff">Remove All Staff</button></div>';
+  }
+
+  function renderAccess() {
+    apiCall('getAccessMatrix').then(function (m) {
+      var html = '<div class="section-note" style="margin-bottom:12px;">Tick which modules each role can view (Read) and change (Write). Admin always has full access and isn\'t shown — it can\'t be locked out from here.</div>';
+      html += '<div class="table-wrap"><table class="data-table"><thead><tr><th>Role</th><th>Module</th><th>Read</th><th>Write</th></tr></thead><tbody>';
+      m.roles.filter(function (r) { return r !== 'Admin'; }).forEach(function (role) {
+        m.modules.forEach(function (mod) {
+          var rule = m.rows.filter(function (r) { return r.role === role && r.module === mod; })[0] || {};
+          var canRead = rule.canRead === true || rule.canRead === 'TRUE' || rule.canRead === 'true';
+          var canWrite = rule.canWrite === true || rule.canWrite === 'TRUE' || rule.canWrite === 'true';
+          html += '<tr><td>' + escapeHtml(role) + '</td><td>' + escapeHtml(mod) + '</td>' +
+            '<td><input type="checkbox" class="acc-cb" data-role="' + escapeHtml(role) + '" data-module="' + mod + '" data-field="canRead"' + (canRead ? ' checked' : '') + '/></td>' +
+            '<td><input type="checkbox" class="acc-cb" data-role="' + escapeHtml(role) + '" data-module="' + mod + '" data-field="canWrite"' + (canWrite ? ' checked' : '') + '/></td></tr>';
+        });
+      });
+      html += '</tbody></table></div>';
+      bodyEl.innerHTML = html;
+      bodyEl.querySelectorAll('.acc-cb').forEach(function (cb) {
+        cb.addEventListener('change', function () {
+          apiCall('saveRolePermission', cb.dataset.role, cb.dataset.module, cb.dataset.field, cb.checked)
+            .then(function () { toast('Access updated.', 'success'); })
+            .catch(function () { cb.checked = !cb.checked; });
+        });
+      });
+    });
+  }
+
+  function renderUnits() {
+    apiCall('listUnitsAdmin').then(function (rows) {
+      bodyEl.innerHTML = '<div id="units-table"></div>';
+      renderTable(document.getElementById('units-table'), [
+        { key: 'unitId', label: 'Unit ID' }, { key: 'name', label: 'Name' }, { key: 'location', label: 'Location' }, { key: 'scope', label: 'Scope' }
+      ], rows, { onEdit: unitForm });
+    });
+  }
+
+  function unitForm(row) {
+    openFormModal({
+      title: 'Update Unit', initial: row,
+      fields: [
+        { key: 'name', label: 'Name', type: 'text', full: true },
+        { key: 'location', label: 'Location', type: 'text' },
+        { key: 'scope', label: 'Scope', type: 'textarea', full: true }
+      ],
+      onSubmit: function (record) { return apiCall('saveUnit', record).then(function () { toast('Saved.', 'success'); render(); }); }
+    });
+  }
+
+  function renderSettings() {
+    apiCall('getAllSettings').then(function (rows) {
+      bodyEl.innerHTML = '<div class="card"><h2>Escalation Thresholds & KPI Config</h2><div class="section-note">Edit and re-save any value; scans pick these up on the next run.</div><div id="settings-table"></div></div>';
+      renderTable(document.getElementById('settings-table'), [
+        { key: 'key', label: 'Setting' }, { key: 'value', label: 'Value' },
+        { key: 'updatedAt', label: 'Updated', render: function (r) { return fmtDate(r.updatedAt); } }
+      ], rows, { onEdit: settingForm });
+    });
+  }
+
+  function renderStates() {
+    apiCall('listStatesAdmin').then(function (rows) {
+      bodyEl.innerHTML = '<div class="card"><div class="page-header"><div><h2>Approved States</h2>' +
+        '<div class="section-note">Contracts must name an active State from this list. Untick Active to retire one.</div></div>' +
+        '<button class="btn" id="btn-new-state">+ Add State</button></div><div id="states-table"></div></div>';
+      renderTable(document.getElementById('states-table'), [
+        { key: 'name', label: 'State' },
+        { key: 'active', label: 'Active', render: function (r) { return (r.active === true || r.active === 'TRUE') ? badge('Active') : badge('Pending'); } }
+      ], rows, { onEdit: stateForm });
+      document.getElementById('btn-new-state').addEventListener('click', function () { stateForm(null); });
+    });
+  }
+
+  function stateForm(row) {
+    openFormModal({
+      title: row ? 'Update State' : 'Add State', initial: row ? Object.assign({}, row, { active: row.active === true || row.active === 'TRUE' }) : { active: true },
+      fields: [{ key: 'name', label: 'State', type: 'text', full: true }, { key: 'active', label: 'Active', type: 'checkbox', checkboxLabel: 'Approved for contracts', default: true }],
+      onSubmit: function (record) { return apiCall('saveState', record).then(function () { toast('Saved.', 'success'); render(); }); }
+    });
+  }
+
+  function renderHolidays() {
+    apiCall('listHolidaysAdmin').then(function (rows) {
+      bodyEl.innerHTML = '<div class="card"><div class="page-header"><div><h2>Public Holidays</h2>' +
+        '<div class="section-note">Not working days for report cut-offs and reminders. Add Eid and Maulud dates, and any Monday the Federal Government declares, when announced.</div></div>' +
+        '<button class="btn" id="btn-new-hol">+ Add Holiday</button></div><div id="hol-table"></div></div>';
+      renderTable(document.getElementById('hol-table'), [
+        { key: 'date', label: 'Date', render: function (r) { return fmtDate(r.date); } },
+        { key: 'name', label: 'Holiday' }, { key: 'notes', label: 'Notes' },
+        { key: '_del', label: '', render: function (r) { return '<button class="btn danger btn-del-hol" data-date="' + escapeHtml(r.date) + '">Delete</button>'; } }
+      ], rows, { onEdit: holidayForm });
+      document.getElementById('btn-new-hol').addEventListener('click', function () { holidayForm(null); });
+      bodyEl.querySelectorAll('.btn-del-hol').forEach(function (btn) {
+        btn.addEventListener('click', function (e) {
+          e.stopPropagation();
+          if (!confirm('Delete the holiday on ' + fmtDate(btn.dataset.date) + '?')) return;
+          apiCall('deleteHoliday', btn.dataset.date).then(function () { toast('Deleted.', 'success'); render(); });
+        });
+      });
+    });
+  }
+
+  function holidayForm(row) {
+    openFormModal({
+      title: row ? 'Update Holiday' : 'Add Holiday', initial: row || {},
+      fields: [{ key: 'date', label: 'Date', type: 'date' }, { key: 'name', label: 'Holiday', type: 'text' }, { key: 'notes', label: 'Notes', type: 'text', full: true }],
+      onSubmit: function (record) { return apiCall('saveHoliday', record).then(function () { toast('Saved.', 'success'); render(); }); }
+    });
+  }
+
+  function settingForm(row) {
+    openFormModal({
+      title: 'Update Setting', initial: row,
+      fields: [{ key: 'key', label: 'Key', type: 'text' }, { key: 'value', label: 'Value', type: 'text' }],
+      onSubmit: function (record) { return apiCall('saveSetting', record.key, record.value).then(function () { toast('Saved.', 'success'); render(); }); }
+    });
+  }
+
+  function renderAudit() {
+    apiCall('getAuditLog').then(function (rows) {
+      renderTable(bodyEl, [
+        { key: 'timestamp', label: 'When', render: function (r) { return fmtDate(r.timestamp); } },
+        { key: 'actor', label: 'Actor' }, { key: 'action', label: 'Action' }, { key: 'module', label: 'Module' },
+        { key: 'refId', label: 'Reference' }, { key: 'details', label: 'Details' }
+      ], rows);
+    });
+  }
+
+  render();
+};
+</script>

@@ -1,0 +1,595 @@
+<script>
+/* ============================================================
+   Rumbu Contract Department — shared client engine
+   Promise wrapper over google.script.run + generic UI components
+   (table, filter bar, modal form, KPI tiles) reused by every module.
+   ============================================================ */
+
+var STATE = { bootstrap: null, currentPage: 'dashboard', sessionToken: null, pollTimer: null, pageIntervals: [] };
+
+/** Register a setInterval that should be cleared automatically when the user
+ *  navigates to a different page — use this for anything that ticks (a live
+ *  clock, a polling refresh) instead of calling setInterval directly. */
+function addPageInterval(fn, ms) {
+  var id = setInterval(fn, ms);
+  STATE.pageIntervals.push(id);
+  return id;
+}
+
+function getSessionToken_() {
+  if (STATE.sessionToken) return STATE.sessionToken;
+  try { return sessionStorage.getItem('rumbu_session_token'); } catch (e) { return null; }
+}
+function setSessionToken_(token) {
+  STATE.sessionToken = token;
+  try { if (token) sessionStorage.setItem('rumbu_session_token', token); else sessionStorage.removeItem('rumbu_session_token'); } catch (e) {}
+}
+
+function api(fnName) {
+  var args = Array.prototype.slice.call(arguments, 1);
+  return new Promise(function (resolve, reject) {
+    var runner = google.script.run
+      .withSuccessHandler(resolve)
+      .withFailureHandler(function (err) { reject(err); });
+    runner.rpc(getSessionToken_(), fnName, args);
+  });
+}
+
+function toast(msg, type) {
+  var host = document.getElementById('toast-host');
+  var el = document.createElement('div');
+  el.className = 'toast' + (type ? ' ' + type : '');
+  el.textContent = msg;
+  host.appendChild(el);
+  setTimeout(function () { el.style.opacity = '0'; el.style.transition = 'opacity .3s'; }, 3200);
+  setTimeout(function () { host.removeChild(el); }, 3600);
+}
+
+function apiCall(fnName) {
+  var args = Array.prototype.slice.call(arguments, 1);
+  return api.apply(null, [fnName].concat(args)).catch(function (err) {
+    var msg = (err && err.message) ? err.message : String(err);
+    if (msg.indexOf('SESSION_EXPIRED') !== -1) {
+      setSessionToken_(null);
+      toast('Your session expired — please log in again.', 'error');
+      if (typeof showLoginGate === 'function') showLoginGate();
+    } else {
+      toast(msg || 'Something went wrong.', 'error');
+    }
+    throw err;
+  });
+}
+
+function fmtDate(d) {
+  if (!d) return '—';
+  var date = new Date(d);
+  if (isNaN(date.getTime())) return String(d);
+  var months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+  return String(date.getDate()).padStart(2, '0') + ' ' + months[date.getMonth()] + ' ' + date.getFullYear();
+}
+
+/** The "time tracker" for uploads/submissions — date plus time-of-day, since
+ *  fmtDate() alone doesn't show when during the day something was submitted. */
+function fmtDateTime(d) {
+  if (!d) return '—';
+  var date = new Date(d);
+  if (isNaN(date.getTime())) return String(d);
+  return fmtDate(date) + ', ' + date.toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' });
+}
+
+function fmtCurrency(n) {
+  var num = Number(n) || 0;
+  return 'NGN ' + num.toLocaleString('en-NG', { maximumFractionDigits: 0 });
+}
+
+/** Client-side CSV export — no server round trip needed since the rows are
+ *  already loaded. Reuses the same {key,label} column config each page already
+ *  passes to renderTable, so headers match what's on screen. */
+function downloadCsv(filename, columns, rows) {
+  var esc = function (v) {
+    var s = (v === undefined || v === null) ? '' : String(v);
+    if (/[",\n]/.test(s)) s = '"' + s.replace(/"/g, '""') + '"';
+    return s;
+  };
+  var header = columns.map(function (c) { return esc(c.label); }).join(',');
+  var lines = rows.map(function (r) { return columns.map(function (c) { return esc(r[c.key]); }).join(','); });
+  var csv = [header].concat(lines).join('\n');
+  var blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+  var url = URL.createObjectURL(blob);
+  var a = document.createElement('a');
+  a.href = url; a.download = filename; document.body.appendChild(a); a.click();
+  setTimeout(function () { document.body.removeChild(a); URL.revokeObjectURL(url); }, 200);
+}
+
+function badge(status) {
+  if (status === undefined || status === null || status === '') return '';
+  var slug = String(status).toLowerCase().replace(/\s+/g, '-');
+  return '<span class="badge status-' + slug + '">' + escapeHtml(String(status)) + '</span>';
+}
+
+/** Turns a Google Drive "view" share link (what uploadEvidence()/getUrl() gives
+ *  you) into a direct-download link, so document tables can offer both
+ *  Review (opens Drive's preview) and Download without a second server call. */
+function driveDownloadUrl(viewUrl) {
+  if (!viewUrl) return '';
+  var m = viewUrl.match(/\/d\/([^\/]+)/);
+  return m ? 'https://drive.google.com/uc?export=download&id=' + m[1] : viewUrl;
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, function (c) {
+    return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+  });
+}
+
+function stripHtml(html) {
+  var d = document.createElement('div');
+  d.innerHTML = html || '';
+  return d.textContent || d.innerText || '';
+}
+
+/** Downloads a plain-text record entirely client-side — no server round trip,
+ *  works even for records with no attached file, since the "document" being
+ *  downloaded here is a snapshot of the record's own data. */
+function downloadTextRecord(filename, content) {
+  var blob = new Blob([content], { type: 'text/plain' });
+  var url = URL.createObjectURL(blob);
+  var a = document.createElement('a');
+  a.href = url; a.download = filename;
+  document.body.appendChild(a); a.click(); document.body.removeChild(a);
+  setTimeout(function () { URL.revokeObjectURL(url); }, 1000);
+}
+
+/** Real PDF download — calls generateRecordPdf() server-side (builds a Google
+ *  Doc, exports it, deletes the scratch Doc) and turns the returned base64
+ *  into a browser download. Distinct from downloadTextRecord: this is an
+ *  actual .pdf file, not a plain-text snapshot. */
+function downloadPdfRecord(title, subtitle, fields) {
+  toast('Generating PDF…');
+  return apiCall('generateRecordPdf', title, subtitle, fields).then(function (res) {
+    var bytes = atob(res.base64);
+    var arr = new Uint8Array(bytes.length);
+    for (var i = 0; i < bytes.length; i++) arr[i] = bytes.charCodeAt(i);
+    var blob = new Blob([arr], { type: 'application/pdf' });
+    var url = URL.createObjectURL(blob);
+    var a = document.createElement('a');
+    a.href = url; a.download = res.filename;
+    document.body.appendChild(a); a.click(); document.body.removeChild(a);
+    setTimeout(function () { URL.revokeObjectURL(url); }, 1000);
+  });
+}
+
+/** Opens a plain, chrome-free print view in a new tab and triggers the browser
+ *  print dialog — used for both single-record printing and whole-table printing. */
+function printHtmlRecord(title, bodyHtml) {
+  var win = window.open('', '_blank');
+  win.document.write(
+    '<html><head><title>' + escapeHtml(title) + '</title><style>' +
+    'body{font-family:Arial,Helvetica,sans-serif;padding:28px;color:#1A2233;}' +
+    'h1{color:#1F3864;font-size:19px;margin-bottom:2px;}' +
+    '.meta{color:#6B7686;font-size:12px;margin-bottom:20px;}' +
+    '.field{margin-bottom:14px;} .label{font-size:10.5px;text-transform:uppercase;color:#6B7686;font-weight:bold;margin-bottom:3px;letter-spacing:0.3px;}' +
+    '.value{font-size:13.5px;white-space:pre-wrap;}' +
+    'table{width:100%;border-collapse:collapse;font-size:12px;} th{text-align:left;border-bottom:2px solid #1F3864;padding:6px;color:#1F3864;}' +
+    'td{padding:6px;border-bottom:1px solid #ddd;vertical-align:top;}' +
+    '.footer{margin-top:30px;font-size:10.5px;color:#999;border-top:1px solid #ddd;padding-top:10px;}' +
+    '</style></head><body>' +
+    '<h1>RUMBU INDUSTRIES GROUP</h1><div class="meta">Agriwatts Nigeria Limited · Contract Office · CONFIDENTIAL</div>' +
+    '<h2 style="color:#2E75B6;font-size:15px;">' + escapeHtml(title) + '</h2>' +
+    bodyHtml +
+    '<div class="footer">Printed ' + new Date().toLocaleString('en-GB') + ' WAT</div>' +
+    '</body></html>'
+  );
+  win.document.close();
+  win.focus();
+  setTimeout(function () { win.print(); }, 300);
+}
+
+/** Prints a whole table using the same column config passed to renderTable —
+ *  button/action cells are stripped down to plain text automatically. */
+function printTableHtml(title, columns, rows) {
+  var html = '<table><thead><tr>' + columns.map(function (c) { return '<th>' + escapeHtml(c.label) + '</th>'; }).join('') + '</tr></thead><tbody>' +
+    rows.map(function (r) {
+      return '<tr>' + columns.map(function (c) {
+        var val = c.render ? stripHtml(c.render(r)) : (r[c.key] === undefined || r[c.key] === null ? '' : r[c.key]);
+        return '<td>' + escapeHtml(val) + '</td>';
+      }).join('') + '</tr>';
+    }).join('') + '</tbody></table>';
+  printHtmlRecord(title, html);
+}
+
+/** Generic single-record viewer: shows a set of label/value fields with
+ *  Print / Download / Delete actions built in. Every "Record" feature across
+ *  Daily Reports, Escalations, Incidents, and Contracts uses this same modal
+ *  so they behave identically. Pass only the actions that apply. */
+/** Generic document-checklist modal — used by both Contracts and Companies,
+ *  since they need identical behavior against a fixed list of document types:
+ *  each row shows Uploaded/Not uploaded, with Upload (file picker) when
+ *  missing, or Review + Delete when present. opts:
+ *  { title, recordId, fetchFn, uploadFn, deleteFn, canWrite } — function
+ *  names as strings, called via apiCall so they go through the same
+ *  permission checks as everything else. */
+function openDocumentChecklist(opts) {
+  var backdrop = document.createElement('div');
+  backdrop.className = 'modal-backdrop';
+  backdrop.innerHTML = '<div class="modal" style="width:680px;"><h2>' + escapeHtml(opts.title) + '</h2><div id="doc-checklist-body"></div>' +
+    '<div class="modal-actions"><button class="btn secondary" id="doc-checklist-close">Close</button></div></div>';
+  document.body.appendChild(backdrop);
+  backdrop.querySelector('#doc-checklist-close').addEventListener('click', function () { document.body.removeChild(backdrop); });
+  backdrop.addEventListener('click', function (e) { if (e.target === backdrop) document.body.removeChild(backdrop); });
+
+  function load() {
+    var bodyEl = backdrop.querySelector('#doc-checklist-body');
+    skeletonBlock(bodyEl, 6);
+    apiCall(opts.fetchFn, opts.recordId).then(function (rows) {
+      var html = '<div class="table-wrap"><table class="data-table"><thead><tr><th>Document</th><th>Status</th><th></th></tr></thead><tbody>';
+      rows.forEach(function (r) {
+        var hasFile = !!r.driveLink;
+        var hasNotes = !!r.notes;
+        var statusCell;
+        if (hasFile || hasNotes) {
+          statusCell = badge('Completed') + ' <span class="section-note">' +
+            (hasFile ? escapeHtml(r.filename || 'File attached') : '') +
+            (hasFile && hasNotes ? ' + note' : (hasNotes ? 'Manual entry' : '')) +
+            ' · ' + fmtDate(r.uploadedAt) + '</span>' +
+            (hasNotes ? '<div class="section-note" style="margin-top:3px;white-space:pre-wrap;max-width:260px;">' + escapeHtml(r.notes) + '</div>' : '');
+        } else {
+          statusCell = badge('Pending') + ' <span class="section-note">Not yet provided</span>';
+        }
+        var actionsCell =
+          (hasFile ? '<a href="' + r.driveLink + '" target="_blank">Review file</a>' : '') +
+          ((hasFile || hasNotes) && opts.canWrite ? ' · <button class="btn danger doc-del" data-id="' + r.id + '" style="padding:3px 9px;font-size:11.5px;">Delete</button>' : '') +
+          (hasFile ? '<br/>' : '');
+        if (opts.canWrite) {
+          actionsCell += '<button class="btn secondary doc-upload" data-doctype="' + escapeHtml(r.docType) + '" style="padding:3px 9px;font-size:11.5px;margin-top:4px;">' + (hasFile ? 'Replace File' : 'Insert (Upload)') + '</button>' +
+            '<input type="file" class="doc-file-input" data-doctype="' + escapeHtml(r.docType) + '" style="display:none;"/> ' +
+            '<button class="btn secondary doc-note" data-doctype="' + escapeHtml(r.docType) + '" data-current="' + escapeHtml(r.notes || '') + '" style="padding:3px 9px;font-size:11.5px;margin-top:4px;">' + (hasNotes ? 'Edit Manual Entry' : 'Manual Entry') + '</button>';
+        }
+        if (!hasFile && !opts.canWrite) actionsCell = actionsCell || '—';
+        html += '<tr><td>' + escapeHtml(r.docType) + '</td><td>' + statusCell + '</td><td>' + actionsCell + '</td></tr>';
+      });
+      html += '</tbody></table></div>';
+      bodyEl.innerHTML = html;
+
+      bodyEl.querySelectorAll('.doc-del').forEach(function (btn) {
+        btn.addEventListener('click', function () {
+          if (!confirm('Delete this document? This cannot be undone.')) return;
+          apiCall(opts.deleteFn, btn.dataset.id).then(function () { toast('Document deleted.', 'success'); load(); });
+        });
+      });
+      bodyEl.querySelectorAll('.doc-upload').forEach(function (btn) {
+        btn.addEventListener('click', function () {
+          var input = bodyEl.querySelector('.doc-file-input[data-doctype="' + btn.dataset.doctype + '"]');
+          input.click();
+        });
+      });
+      bodyEl.querySelectorAll('.doc-file-input').forEach(function (input) {
+        input.addEventListener('change', function () {
+          var file = input.files[0];
+          if (!file) return;
+          var reader = new FileReader();
+          reader.onload = function () {
+            var base64 = reader.result.split(',')[1];
+            toast('Uploading…');
+            apiCall(opts.uploadFn, opts.recordId, input.dataset.doctype, base64, file.type || 'application/octet-stream', file.name)
+              .then(function () { toast('Uploaded.', 'success'); load(); });
+          };
+          reader.readAsDataURL(file);
+        });
+      });
+      bodyEl.querySelectorAll('.doc-note').forEach(function (btn) {
+        btn.addEventListener('click', function () {
+          var text = prompt('Manual entry for "' + btn.dataset.doctype + '":', btn.dataset.current || '');
+          if (text === null) return; // cancelled
+          if (!text.trim()) { toast('Enter some text, or use Delete to remove an existing entry.', 'error'); return; }
+          apiCall(opts.noteFn, opts.recordId, btn.dataset.doctype, text).then(function () { toast('Saved.', 'success'); load(); });
+        });
+      });
+    });
+  }
+
+  load();
+}
+
+function openRecordViewer(opts) {
+  var backdrop = document.createElement('div');
+  backdrop.className = 'modal-backdrop';
+  var fieldsHtml = opts.fields.map(function (f) {
+    return '<div class="form-field"><label>' + escapeHtml(f.label) + '</label>' +
+      '<div style="padding:8px 10px;background:#F6F8FB;border-radius:8px;font-size:13px;white-space:pre-wrap;max-height:220px;overflow-y:auto;">' +
+      (f.html ? f.html : escapeHtml(f.value || '—')) + '</div></div>';
+  }).join('');
+  var actionsHtml = '<button class="btn secondary" id="rv-close">Close</button>';
+  if (opts.onPrint !== false) actionsHtml = '<button class="btn secondary" id="rv-print">Print</button>' + actionsHtml;
+  if (opts.pdfData) actionsHtml = '<button class="btn secondary" id="rv-pdf">Download PDF</button>' + actionsHtml;
+  if (opts.onDownload) actionsHtml = '<button class="btn secondary" id="rv-download">Download (.txt)</button>' + actionsHtml;
+  if (opts.onDelete) actionsHtml += '<button class="btn danger" id="rv-delete" style="margin-left:auto;">Delete</button>';
+  backdrop.innerHTML =
+    '<div class="modal"><h2>' + escapeHtml(opts.title) + '</h2>' +
+    (opts.subtitle ? '<div class="section-note" style="margin-bottom:12px;">' + escapeHtml(opts.subtitle) + '</div>' : '') +
+    fieldsHtml +
+    '<div class="modal-actions" style="display:flex;">' + actionsHtml + '</div></div>';
+  document.body.appendChild(backdrop);
+
+  function close() { if (document.body.contains(backdrop)) document.body.removeChild(backdrop); }
+  backdrop.querySelector('#rv-close').addEventListener('click', close);
+  backdrop.addEventListener('click', function (e) { if (e.target === backdrop) close(); });
+  var printBtn = backdrop.querySelector('#rv-print');
+  if (printBtn) printBtn.addEventListener('click', function () {
+    printHtmlRecord(opts.title, opts.fields.map(function (f) { return '<div class="field"><div class="label">' + escapeHtml(f.label) + '</div><div class="value">' + escapeHtml(f.value || '—') + '</div></div>'; }).join(''));
+  });
+  var dlBtn = backdrop.querySelector('#rv-download');
+  if (dlBtn) dlBtn.addEventListener('click', function () { opts.onDownload(); });
+  var pdfBtn = backdrop.querySelector('#rv-pdf');
+  if (pdfBtn) pdfBtn.addEventListener('click', function () {
+    pdfBtn.disabled = true; pdfBtn.textContent = 'Generating…';
+    downloadPdfRecord(opts.pdfData.title, opts.pdfData.subtitle, opts.pdfData.fields)
+      .then(function () { pdfBtn.disabled = false; pdfBtn.textContent = 'Download PDF'; })
+      .catch(function () { pdfBtn.disabled = false; pdfBtn.textContent = 'Download PDF'; });
+  });
+  var delBtn = backdrop.querySelector('#rv-delete');
+  if (delBtn) delBtn.addEventListener('click', function () {
+    if (!confirm('Delete this record? This cannot be undone.')) return;
+    Promise.resolve(opts.onDelete()).then(close);
+  });
+}
+
+/** Shared by DailyReportsView and the Dashboard's per-unit panel so a report
+ *  behaves identically wherever it's shown — same columns, same View/Delete
+ *  actions, same PDF export. opts: { canWrite, onChange } */
+function renderDailyReportsTable(container, rows, opts) {
+  opts = opts || {};
+  function documentActionsHtml(link) {
+    if (!link) return '—';
+    var idMatch = link.match(/\/d\/([a-zA-Z0-9_-]+)/) || link.match(/[?&]id=([a-zA-Z0-9_-]+)/);
+    var fileId = idMatch ? idMatch[1] : null;
+    var downloadUrl = fileId ? ('https://drive.google.com/uc?export=download&id=' + fileId) : link;
+    return '<a href="' + link + '" target="_blank">Review</a> · <a href="' + downloadUrl + '" target="_blank">Download</a>';
+  }
+  renderTable(container, [
+    { key: 'date', label: 'Date', render: function (r) { return fmtDate(r.date); } },
+    { key: 'unit', label: 'Unit' }, { key: 'staffName', label: 'Staff' }, { key: 'siteVisited', label: 'Site' },
+    { key: 'activitySummary', label: 'Report', render: function (r) {
+        var out = escapeHtml(r.activitySummary || '');
+        if (r.isEmergency) out += '<div style="margin-top:4px;">' + badge('High') + ' <b>Emergency:</b> ' + escapeHtml(r.emergencyDetails || '') + '</div>';
+        return out;
+      } },
+    { key: 'evidenceLink', label: 'Document', render: function (r) { return documentActionsHtml(r.evidenceLink); } },
+    { key: 'createdAt', label: 'Submitted', render: function (r) { return fmtDateTime(r.createdAt); } },
+    { key: '_actions', label: '', render: function (r) {
+        return '<button class="btn secondary btn-view-dr" data-id="' + r.id + '">View</button>' +
+          (opts.canWrite ? ' <button class="btn danger btn-del-dr" data-id="' + r.id + '">Delete</button>' : '');
+      } }
+  ], rows, { emptyMessage: opts.emptyMessage || 'No reports yet for these filters.' });
+
+  function reallyDelete(id) {
+    return apiCall('deleteDailyReport', id).then(function () { toast('Report deleted.', 'success'); if (opts.onChange) opts.onChange(); });
+  }
+  function deleteById(id) {
+    if (!confirm('Delete this report? This cannot be undone.')) return;
+    reallyDelete(id);
+  }
+
+  container.querySelectorAll('.btn-view-dr').forEach(function (btn) {
+    btn.addEventListener('click', function () {
+      var r = rows.filter(function (x) { return x.id === btn.dataset.id; })[0];
+      if (!r) return;
+      var textRecord = 'DAILY REPORT — ' + r.id + '\nDate: ' + fmtDate(r.date) + '\nUnit: ' + r.unit + '\nStaff: ' + r.staffName +
+        '\nSubmitted: ' + fmtDateTime(r.createdAt) + '\nSite Visited: ' + (r.siteVisited || '—') + '\nSummary: ' + (r.activitySummary || '—') +
+        (r.isEmergency ? '\n\nEMERGENCY DETAILS: ' + (r.emergencyDetails || '') : '') +
+        (r.evidenceLink ? '\n\nAttached document: ' + r.evidenceLink : '');
+      openRecordViewer({
+        title: 'Daily Report — ' + r.staffName + ' (' + fmtDate(r.date) + ')',
+        subtitle: r.unit + (r.isEmergency ? ' · Emergency' : '') + ' · Submitted ' + fmtDateTime(r.createdAt),
+        fields: [
+          { label: 'Site Visited', value: r.siteVisited },
+          { label: 'Summary', value: r.activitySummary },
+          { label: 'Emergency Details', value: r.isEmergency ? r.emergencyDetails : null },
+          { label: 'Attached Document', html: r.evidenceLink ? documentActionsHtml(r.evidenceLink) : '—' }
+        ],
+        onDownload: function () { downloadTextRecord('DailyReport-' + r.id + '.txt', textRecord); },
+        pdfData: {
+          title: 'Daily Report - ' + r.staffName, subtitle: r.unit + ' · ' + fmtDate(r.date),
+          fields: [
+            { label: 'Unit', value: r.unit }, { label: 'Staff', value: r.staffName },
+            { label: 'Submitted', value: fmtDateTime(r.createdAt) }, { label: 'Site Visited', value: r.siteVisited },
+            { label: 'Summary', value: r.activitySummary },
+            { label: 'Emergency Details', value: r.isEmergency ? r.emergencyDetails : '' }
+          ]
+        },
+        onDelete: opts.canWrite ? function () { return reallyDelete(r.id); } : null
+      });
+    });
+  });
+  container.querySelectorAll('.btn-del-dr').forEach(function (btn) {
+    btn.addEventListener('click', function () { deleteById(btn.dataset.id); });
+  });
+}
+
+function skeletonBlock(container, lines) {
+  var html = '';
+  for (var i = 0; i < (lines || 5); i++) html += '<div class="skeleton" style="width:' + (60 + Math.random() * 35) + '%"></div>';
+  container.innerHTML = html;
+}
+
+/* ---------- KPI tiles ---------- */
+function kpiTilesHtml(tiles) {
+  return '<div class="kpi-grid">' + tiles.map(function (t) {
+    return '<div class="kpi-tile' + (t.tone ? ' tone-' + t.tone : '') + '">' +
+      '<div class="kpi-value">' + t.value + '</div><div class="kpi-label">' + escapeHtml(t.label) + '</div></div>';
+  }).join('') + '</div>';
+}
+
+/* ---------- Generic filter bar ---------- */
+function renderFilterBar(container, opts, onChange) {
+  opts = opts || {};
+  var units = STATE.bootstrap.units || [];
+  var statusOptions = opts.statuses || [];
+  var html = '<div class="filter-bar">';
+  if (!opts.hideUnit) html += fieldSelect_('f-unit', 'Unit', [{ v: '', l: 'All units' }].concat(units.map(function (u) { return { v: u.unitId, l: u.name }; })));
+  if (!opts.hideDepartment) html += fieldInput_('f-department', 'Department', 'text', 'Any department');
+  if (!opts.hidePerson) html += fieldInput_('f-person', 'Responsible person', 'text', 'Any person');
+  if (statusOptions.length) html += fieldSelect_('f-status', 'Status', [{ v: '', l: 'All statuses' }].concat(statusOptions.map(function (s) { return { v: s, l: s }; })));
+  if (!opts.hideDate) { html += fieldInput_('f-from', 'From', 'date', ''); html += fieldInput_('f-to', 'To', 'date', ''); }
+  if (!opts.hideSearch) html += fieldInput_('f-q', 'Search', 'text', 'Keyword…');
+  if (!opts.hideClear) html += '<div class="field"><button class="btn secondary" id="f-clear">Clear</button></div>';
+  html += '</div>';
+  container.innerHTML = html;
+
+  var read = function () {
+    return {
+      unit: byId_('f-unit') ? byId_('f-unit').value : (opts.fixedUnit || ''),
+      department: byId_('f-department') ? byId_('f-department').value : '',
+      responsiblePerson: byId_('f-person') ? byId_('f-person').value : '',
+      status: statusOptions.length ? byId_('f-status').value : undefined,
+      dateFrom: byId_('f-from') ? byId_('f-from').value : '', dateTo: byId_('f-to') ? byId_('f-to').value : '',
+      q: byId_('f-q') ? byId_('f-q').value : ''
+    };
+  };
+  ['f-unit', 'f-department', 'f-person', 'f-status', 'f-from', 'f-to'].forEach(function (id) {
+    var el = byId_(id); if (el) el.addEventListener('change', function () { onChange(read()); });
+  });
+  var q = byId_('f-q'); if (q) q.addEventListener('input', debounce_(function () { onChange(read()); }, 350));
+  var clearBtn = byId_('f-clear');
+  if (clearBtn) clearBtn.addEventListener('click', function () {
+    container.querySelectorAll('input').forEach(function (i) { i.value = ''; });
+    container.querySelectorAll('select').forEach(function (s) { s.value = ''; });
+    onChange({});
+  });
+  return read;
+}
+
+function fieldSelect_(id, label, options) {
+  return '<div class="field"><label>' + label + '</label><select id="' + id + '">' +
+    options.map(function (o) { return '<option value="' + escapeHtml(o.v) + '">' + escapeHtml(o.l) + '</option>'; }).join('') + '</select></div>';
+}
+function fieldInput_(id, label, type, placeholder) {
+  return '<div class="field"><label>' + label + '</label><input id="' + id + '" type="' + type + '" placeholder="' + (placeholder || '') + '"/></div>';
+}
+function byId_(id) { return document.getElementById(id); }
+function debounce_(fn, ms) { var t; return function () { clearTimeout(t); var a = arguments; t = setTimeout(function () { fn.apply(null, a); }, ms); }; }
+
+/* ---------- Generic sortable data table ---------- */
+function renderTable(container, columns, rows, opts) {
+  opts = opts || {};
+  if (!rows.length) {
+    container.innerHTML = '<div class="empty-state">' + (opts.emptyMessage || 'No records match the current filters.') + '</div>';
+    return;
+  }
+  var html = '<div class="table-wrap"><table class="data-table"><thead><tr>' +
+    columns.map(function (c) { return '<th data-key="' + c.key + '">' + escapeHtml(c.label) + '</th>'; }).join('') +
+    (opts.onEdit ? '<th></th>' : '') + '</tr></thead><tbody>';
+  rows.forEach(function (row, idx) {
+    html += '<tr data-idx="' + idx + '">' + columns.map(function (c) {
+      var val = c.render ? c.render(row) : escapeHtml(row[c.key] === undefined || row[c.key] === null ? '' : row[c.key]);
+      return '<td>' + val + '</td>';
+    }).join('') + (opts.onEdit ? '<td><button class="btn secondary btn-edit">' + escapeHtml(opts.editLabel || 'Edit') + '</button></td>' : '') + '</tr>';
+  });
+  html += '</tbody></table></div>';
+  container.innerHTML = html;
+
+  if (opts.onEdit) {
+    container.querySelectorAll('.btn-edit').forEach(function (btn) {
+      btn.addEventListener('click', function (e) {
+        var idx = Number(e.target.closest('tr').dataset.idx);
+        opts.onEdit(rows[idx]);
+      });
+    });
+  }
+  if (opts.onRowClick) {
+    container.querySelectorAll('tbody tr').forEach(function (tr) {
+      tr.addEventListener('click', function () { opts.onRowClick(rows[Number(tr.dataset.idx)]); });
+    });
+  }
+}
+
+/* ---------- Generic modal form, driven by a field-config array ----------
+   field: { key, label, type: text|textarea|number|date|select|checkbox, options?, full? } */
+function openFormModal(opts) {
+  var backdrop = document.createElement('div');
+  backdrop.className = 'modal-backdrop';
+  var initial = opts.initial || {};
+  var fieldsHtml = opts.fields.map(function (f) {
+    var val = initial[f.key] !== undefined ? initial[f.key] : (f.default !== undefined ? f.default : '');
+    var wrap = '<div class="form-field' + (f.full ? ' full' : '') + '">';
+    wrap += '<label>' + escapeHtml(f.label) + '</label>';
+    if (f.type === 'select') {
+      wrap += '<select data-key="' + f.key + '">' + (f.options || []).map(function (o) {
+        var ov = typeof o === 'string' ? o : o.v; var ol = typeof o === 'string' ? o : o.l;
+        return '<option value="' + escapeHtml(ov) + '"' + (String(ov) === String(val) ? ' selected' : '') + '>' + escapeHtml(ol) + '</option>';
+      }).join('') + '</select>';
+    } else if (f.type === 'textarea') {
+      wrap += '<textarea data-key="' + f.key + '">' + escapeHtml(val) + '</textarea>';
+    } else if (f.type === 'checkbox') {
+      wrap += '<div class="checkbox-row"><input type="checkbox" data-key="' + f.key + '" ' + (val ? 'checked' : '') + '/> <span>' + (f.checkboxLabel || '') + '</span></div>';
+    } else {
+      var inputVal = (f.type === 'date' && val) ? formatDateInput_(val) : val;
+      wrap += '<input data-key="' + f.key + '" type="' + (f.type || 'text') + '" value="' + escapeHtml(inputVal) + '"' + (f.listId ? ' list="' + f.listId + '"' : '') + '/>';
+    }
+    wrap += '</div>';
+    return wrap;
+  }).join('');
+
+  backdrop.innerHTML =
+    '<div class="modal"><h2>' + escapeHtml(opts.title) + '</h2>' +
+    '<div class="form-grid">' + fieldsHtml + '</div>' +
+    '<div class="modal-actions"><button class="btn secondary" id="modal-cancel">Cancel</button>' +
+    '<button class="btn" id="modal-save">Save</button></div></div>';
+  document.body.appendChild(backdrop);
+
+  backdrop.querySelector('#modal-cancel').addEventListener('click', function () { document.body.removeChild(backdrop); });
+  backdrop.addEventListener('click', function (e) { if (e.target === backdrop) document.body.removeChild(backdrop); });
+  backdrop.querySelector('#modal-save').addEventListener('click', function () {
+    var record = Object.assign({}, initial);
+    opts.fields.forEach(function (f) {
+      var el = backdrop.querySelector('[data-key="' + f.key + '"]');
+      if (f.type === 'checkbox') record[f.key] = el.checked;
+      else record[f.key] = el.value;
+    });
+    var btn = backdrop.querySelector('#modal-save');
+    btn.disabled = true; btn.textContent = 'Saving…';
+    Promise.resolve(opts.onSubmit(record)).then(function () {
+      document.body.removeChild(backdrop);
+    }).catch(function () {
+      btn.disabled = false; btn.textContent = 'Save';
+    });
+  });
+}
+
+function formatDateInput_(v) {
+  var d = new Date(v);
+  if (isNaN(d.getTime())) return '';
+  return d.toISOString().slice(0, 10);
+}
+
+/* ---------- Router ---------- */
+function navigate(page) {
+  if (STATE.pollTimer) { clearInterval(STATE.pollTimer); STATE.pollTimer = null; }
+  STATE.pageIntervals.forEach(function (id) { clearInterval(id); });
+  STATE.pageIntervals = [];
+  STATE.currentPage = page;
+  location.hash = page;
+  document.querySelectorAll('#sidebar .nav-item').forEach(function (el) {
+    el.classList.toggle('active', el.dataset.page === page);
+  });
+  var main = document.getElementById('page-content');
+  main.innerHTML = '';
+  skeletonBlock(main, 6);
+  var renderFn = window['renderPage_' + page];
+  if (typeof renderFn === 'function') {
+    renderFn(main);
+  } else {
+    main.innerHTML = '<div class="empty-state">Module "' + escapeHtml(page) + '" not found.</div>';
+  }
+  if (window.innerWidth <= 880) document.getElementById('sidebar').classList.remove('open');
+}
+
+window.addEventListener('hashchange', function () {
+  var page = location.hash.replace('#', '') || 'dashboard';
+  // navigate() itself sets location.hash, which fires this event again. Without this
+  // check every page rendered twice and the first render's late results could hit
+  // elements that no longer exist. Back/forward still works: they change the page.
+  if (page === STATE.currentPage) return;
+  navigate(page);
+});
+</script>
